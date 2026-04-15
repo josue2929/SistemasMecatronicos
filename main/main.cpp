@@ -1,240 +1,513 @@
-#include "definitions.h"
+#include <ctype.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
-long stepCount = 0;
-float target_deg = 180.0f;
-float kp = 1.0f;
-bool motor_enabled = true;
+#include "actuators.h"
+#include "app_config.h"
+#include "bluetooth_spp.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "sensors.h"
+#include "stepper_control.h"
 
-float min_delay_us = 1200.0f;
-float max_delay_us = 12000.0f;
+namespace {
 
-char rx_line[128] = {0};
-volatile bool cmd_ready = false;
-int rx_index = 0;
+constexpr const char* TAG = "APP";
 
-static uint32_t spp_client_handle = 0;
+struct AppState {
+    bool stream_bt;
+    bool auto_mode;
+    bool safety_enabled;
+    float pressure_setpoint_kpa;
+    char safety_reason[64];
+    bool safety_ok;
+};
 
-void pulseStep(int step_period_us)
+AppState s_app = {
+    APP_TELEMETRY_DEFAULT_STREAM_BT,
+    false,
+    true,
+    APP_AUTO_PRESSURE_SETPOINT_KPA,
+    "OK",
+    true,
+};
+
+uint64_t millis()
 {
-    gpio_set_level(STEP_PIN, 1);
-    esp_rom_delay_us(5);
-    gpio_set_level(STEP_PIN, 0);
+    return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
 
-    if (step_period_us > 5) {
-        esp_rom_delay_us(step_period_us - 5);
+bool equals_ignore_case(const char* lhs, const char* rhs)
+{
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+
+    while (*lhs != '\0' && *rhs != '\0') {
+        if (toupper(static_cast<unsigned char>(*lhs)) !=
+            toupper(static_cast<unsigned char>(*rhs))) {
+            return false;
+        }
+        lhs++;
+        rhs++;
+    }
+
+    return *lhs == '\0' && *rhs == '\0';
+}
+
+bool starts_with_ignore_case(const char* text, const char* prefix)
+{
+    if (text == nullptr || prefix == nullptr) {
+        return false;
+    }
+
+    while (*prefix != '\0') {
+        if (*text == '\0') {
+            return false;
+        }
+        if (toupper(static_cast<unsigned char>(*text)) !=
+            toupper(static_cast<unsigned char>(*prefix))) {
+            return false;
+        }
+        text++;
+        prefix++;
+    }
+
+    return true;
+}
+
+char* trim(char* text)
+{
+    if (text == nullptr) {
+        return text;
+    }
+
+    while (isspace(static_cast<unsigned char>(*text))) {
+        text++;
+    }
+
+    char* end = text + strlen(text);
+    while (end > text && isspace(static_cast<unsigned char>(*(end - 1)))) {
+        end--;
+    }
+    *end = '\0';
+    return text;
+}
+
+void reply(const char* fmt, ...)
+{
+    char msg[256] = {};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    printf("%s\n", msg);
+    bluetooth_spp_send_line(msg);
+}
+
+bool parse_bool_arg(const char* cmd, bool* out)
+{
+    const char* value = strchr(cmd, ':');
+    if (value == nullptr || out == nullptr) {
+        return false;
+    }
+    value++;
+
+    if (equals_ignore_case(value, "1") ||
+        equals_ignore_case(value, "ON") ||
+        equals_ignore_case(value, "TRUE")) {
+        *out = true;
+        return true;
+    }
+
+    if (equals_ignore_case(value, "0") ||
+        equals_ignore_case(value, "OFF") ||
+        equals_ignore_case(value, "FALSE")) {
+        *out = false;
+        return true;
+    }
+
+    return false;
+}
+
+bool parse_float_after_colon(const char* cmd, float* out)
+{
+    const char* value = strchr(cmd, ':');
+    if (value == nullptr || out == nullptr) {
+        return false;
+    }
+    return sscanf(value + 1, "%f", out) == 1 && isfinite(*out);
+}
+
+void format_telemetry_header(char* out, size_t out_len)
+{
+    char sensor_header[512] = {};
+    char actuator_header[128] = {};
+    sensors_format_csv_header(sensor_header, sizeof(sensor_header));
+    actuators_format_csv_header(actuator_header, sizeof(actuator_header));
+    snprintf(out, out_len,
+             "%s,%s,step_position_deg,step_target_deg,step_kp,step_count,motor_enabled,"
+             "auto_mode,stream_bt,safety_ok,safety_reason",
+             sensor_header,
+             actuator_header);
+}
+
+void format_telemetry(const SensorSnapshot& snapshot, char* out, size_t out_len)
+{
+    char sensor_csv[512] = {};
+    char actuator_csv[128] = {};
+    sensors_format_csv(snapshot, sensor_csv, sizeof(sensor_csv));
+    actuators_format_csv(actuator_csv, sizeof(actuator_csv));
+
+    const StepperStatus stepper = stepper_get_status();
+    snprintf(out, out_len,
+             "%s,%s,%.2f,%.2f,%.3f,%ld,%d,%d,%d,%d,%s",
+             sensor_csv,
+             actuator_csv,
+             stepper.position_deg,
+             stepper.target_deg,
+             stepper.kp,
+             stepper.step_count,
+             stepper.enabled ? 1 : 0,
+             s_app.auto_mode ? 1 : 0,
+             s_app.stream_bt ? 1 : 0,
+             s_app.safety_ok ? 1 : 0,
+             s_app.safety_reason);
+}
+
+void send_telemetry_header()
+{
+    char header[768] = {};
+    format_telemetry_header(header, sizeof(header));
+    printf("%s\n", header);
+    bluetooth_spp_send_line(header);
+}
+
+void send_telemetry(const SensorSnapshot& snapshot)
+{
+    char line[768] = {};
+    format_telemetry(snapshot, line, sizeof(line));
+    printf("%s\n", line);
+    if (s_app.stream_bt) {
+        bluetooth_spp_send_line(line);
     }
 }
 
-void setDirection(bool dir)
+void send_help()
 {
-    gpio_set_level(DIR_PIN, dir ? 1 : 0);
+    bluetooth_spp_send_line("Commands:");
+    bluetooth_spp_send_line("T:<deg> | STEP:<deg>    set stepper target");
+    bluetooth_spp_send_line("K:<kp>                 set stepper proportional gain");
+    bluetooth_spp_send_line("P1:0|1 P2:0|1          pump control");
+    bluetooth_spp_send_line("V1:0|1 V2:0|1          valve control");
+    bluetooth_spp_send_line("ACT:0                  all pumps/valves off");
+    bluetooth_spp_send_line("S | H | I              stop all, home counter, status");
+    bluetooth_spp_send_line("R | READ | HEADER      read telemetry or print CSV header");
+    bluetooth_spp_send_line("STREAM:0|1             Bluetooth telemetry stream");
+    bluetooth_spp_send_line("AUTO:0|1               reference automatic stepper mode");
+    bluetooth_spp_send_line("P:<kPa>                automatic pressure setpoint");
+    bluetooth_spp_send_line("SAFE:0|1               safety interlocks");
 }
 
-float getPositionDeg()
+void evaluate_safety(const SensorSnapshot& snapshot)
 {
-    return stepCount * DEG_PER_STEP;
-}
+    s_app.safety_ok = true;
+    snprintf(s_app.safety_reason, sizeof(s_app.safety_reason), "OK");
 
-int controlToDelayUs(float control_abs)
-{
-    if (control_abs > 100.0f) control_abs = 100.0f;
+    if (APP_SAFETY_STOP_ON_T3_FULL && snapshot.s3_level.level) {
+        s_app.safety_ok = false;
+        snprintf(s_app.safety_reason, sizeof(s_app.safety_reason), "T3_FULL");
+        return;
+    }
 
-    float delay = max_delay_us - ((control_abs / 100.0f) * (max_delay_us - min_delay_us));
+    if (isfinite(snapshot.pressure.pressure_kpa) &&
+        snapshot.pressure.pressure_kpa > APP_SAFETY_PRESSURE_MAX_KPA) {
+        s_app.safety_ok = false;
+        snprintf(s_app.safety_reason, sizeof(s_app.safety_reason), "PRESSURE_HIGH");
+        return;
+    }
 
-    if (delay < min_delay_us) delay = min_delay_us;
-    if (delay > max_delay_us) delay = max_delay_us;
+    if (isfinite(snapshot.temperature.temperature_c) &&
+        (snapshot.temperature.temperature_c < APP_SAFETY_TEMPERATURE_MIN_C ||
+         snapshot.temperature.temperature_c > APP_SAFETY_TEMPERATURE_MAX_C)) {
+        s_app.safety_ok = false;
+        snprintf(s_app.safety_reason, sizeof(s_app.safety_reason), "TEMP_RANGE");
+        return;
+    }
 
-    return (int)delay;
-}
-
-static void bt_send(const char* msg)
-{
-    if (spp_client_handle != 0 && msg != nullptr) {
-        esp_spp_write(spp_client_handle, strlen(msg), (uint8_t*)msg);
+    if (APP_SAFETY_STOP_ON_SENSOR_FAULT &&
+        (!isfinite(snapshot.pressure.pressure_kpa) ||
+         !isfinite(snapshot.temperature.temperature_c))) {
+        s_app.safety_ok = false;
+        snprintf(s_app.safety_reason, sizeof(s_app.safety_reason), "SENSOR_FAULT");
     }
 }
 
-void processCommand(const char* cmd)
+void update_automatic_mode(const SensorSnapshot& snapshot)
 {
-    if (cmd == nullptr) return;
+    if (!s_app.auto_mode) {
+        return;
+    }
 
-    if (strncmp(cmd, "T:", 2) == 0) {
-        float new_target = 0.0f;
-        if (sscanf(cmd, "T:%f", &new_target) == 1) {
-            target_deg = new_target;
-            motor_enabled = true;
+    if (s_app.safety_enabled && !s_app.safety_ok) {
+        actuators_stop_all();
+        stepper_set_target_deg(APP_AUTO_CLOSED_TARGET_DEG);
+        return;
+    }
 
-            char msg[64];
-            snprintf(msg, sizeof(msg), "OK TARGET=%.2f\r\n", target_deg);
-            bt_send(msg);
-            printf("%s", msg);
+    const bool source_available = snapshot.s1_level.level || snapshot.s2_level.level;
+    const bool destination_full = snapshot.s3_level.level;
+    if (!source_available || destination_full) {
+        actuators_stop_all();
+        stepper_set_target_deg(APP_AUTO_CLOSED_TARGET_DEG);
+        return;
+    }
+
+    if (isfinite(snapshot.pressure.pressure_kpa)) {
+        if (snapshot.pressure.pressure_kpa >
+            (s_app.pressure_setpoint_kpa + APP_AUTO_PRESSURE_HYSTERESIS_KPA)) {
+            actuators_stop_all();
+            stepper_set_target_deg(APP_AUTO_CLOSED_TARGET_DEG);
+            return;
+        }
+
+        if (snapshot.pressure.pressure_kpa <
+            (s_app.pressure_setpoint_kpa - APP_AUTO_PRESSURE_HYSTERESIS_KPA)) {
+            stepper_set_target_deg(APP_AUTO_OPEN_TARGET_DEG);
+            return;
         }
     }
-    else if (strncmp(cmd, "K:", 2) == 0) {
-        float new_kp = 0.0f;
-        if (sscanf(cmd, "K:%f", &new_kp) == 1 && new_kp > 0.0f) {
-            kp = new_kp;
 
-            char msg[64];
-            snprintf(msg, sizeof(msg), "OK KP=%.3f\r\n", kp);
-            bt_send(msg);
-            printf("%s", msg);
-        }
-    }
-    else if (strcmp(cmd, "S") == 0) {
-        motor_enabled = false;
-        bt_send("OK STOP\r\n");
-        printf("OK STOP\n");
-    }
-    else if (strcmp(cmd, "H") == 0) {
-        stepCount = 0;
-        bt_send("OK HOME\r\n");
-        printf("OK HOME\n");
-    }
-    else if (strcmp(cmd, "I") == 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "POS=%.2f deg | TARGET=%.2f | KP=%.3f | STEPS=%ld\r\n",
-                 getPositionDeg(), target_deg, kp, stepCount);
-        bt_send(msg);
-        printf("%s", msg);
-    }
-    else {
-        bt_send("UNKNOWN CMD\r\n");
-        printf("UNKNOWN CMD: %s\n", cmd);
-    }
+    stepper_set_target_deg(APP_AUTO_OPEN_TARGET_DEG);
 }
 
-static void spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+void enforce_manual_safety()
 {
-    switch (event) {
-    case ESP_SPP_INIT_EVT:
-        esp_bt_dev_set_device_name(BT_DEVICE_NAME);
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-        esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME);
-        ESP_LOGI(SPP_TAG, "SPP init done");
-        break;
+    if (!s_app.safety_enabled || s_app.auto_mode || s_app.safety_ok) {
+        return;
+    }
 
-    case ESP_SPP_START_EVT:
-        ESP_LOGI(SPP_TAG, "SPP server started");
-        break;
+    stepper_stop();
+    actuators_stop_all();
+}
 
-    case ESP_SPP_SRV_OPEN_EVT:
-        spp_client_handle = param->srv_open.handle;
-        ESP_LOGI(SPP_TAG, "Client connected, handle=%lu", (unsigned long)spp_client_handle);
-        bt_send("Bluetooth connected\r\n");
-        break;
+void send_status()
+{
+    const StepperStatus stepper = stepper_get_status();
+    const ActuatorStatus actuators = actuators_get_status();
+    reply("STATUS POS=%.2f TARGET=%.2f KP=%.3f STEPS=%ld MOTOR=%s P1=%s P2=%s V1=%s V2=%s AUTO=%s STREAM=%s SAFE=%s REASON=%s PSET=%.2f",
+          stepper.position_deg,
+          stepper.target_deg,
+          stepper.kp,
+          stepper.step_count,
+          stepper.enabled ? "ON" : "OFF",
+          actuators.pump1_on ? "ON" : "OFF",
+          actuators.pump2_on ? "ON" : "OFF",
+          actuators.valve1_on ? "ON" : "OFF",
+          actuators.valve2_on ? "ON" : "OFF",
+          s_app.auto_mode ? "ON" : "OFF",
+          s_app.stream_bt ? "ON" : "OFF",
+          s_app.safety_enabled ? "ON" : "OFF",
+          s_app.safety_reason,
+          s_app.pressure_setpoint_kpa);
+}
 
-    case ESP_SPP_CLOSE_EVT:
-        spp_client_handle = 0;
-        ESP_LOGI(SPP_TAG, "Client disconnected");
-        break;
+void process_command(char* raw_cmd, SensorSnapshot* snapshot, bool* have_snapshot)
+{
+    char* cmd = trim(raw_cmd);
+    if (cmd == nullptr || cmd[0] == '\0') {
+        return;
+    }
 
-    case ESP_SPP_DATA_IND_EVT:
-        for (int i = 0; i < param->data_ind.len; i++) {
-            char c = (char)param->data_ind.data[i];
+    if (equals_ignore_case(cmd, "HELP") || equals_ignore_case(cmd, "?")) {
+        send_help();
+        return;
+    }
 
-            if (c == '\r') continue;
-
-            if (c == '\n') {
-                if (rx_index > 0) {
-                    rx_line[rx_index] = '\0';
-                    cmd_ready = true;
-                    rx_index = 0;
-                }
+    ActuatorId actuator_id = ActuatorId::Pump1;
+    if (actuator_id_from_command(cmd, &actuator_id)) {
+        bool enabled = false;
+        if (parse_bool_arg(cmd, &enabled)) {
+            s_app.auto_mode = false;
+            if (s_app.safety_enabled && !s_app.safety_ok && enabled) {
+                reply("ERR safety active: %s", s_app.safety_reason);
             } else {
-                if (rx_index < (int)sizeof(rx_line) - 1) {
-                    rx_line[rx_index++] = c;
-                }
+                actuators_set(actuator_id, enabled);
+                reply("OK %s=%s", actuator_name(actuator_id), enabled ? "ON" : "OFF");
             }
+        } else {
+            reply("ERR invalid actuator value");
         }
-        break;
-
-    default:
-        break;
+        return;
     }
-}
 
-static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
-{
-    (void)event;
-    (void)param;
-}
-
-void init_bluetooth()
-{
-    esp_err_t ret;
-
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    if (starts_with_ignore_case(cmd, "ACT:")) {
+        bool enabled = false;
+        if (parse_bool_arg(cmd, &enabled) && !enabled) {
+            actuators_stop_all();
+            reply("OK ACTUATORS=OFF");
+        } else {
+            reply("ERR use ACT:0 to turn all actuators off");
+        }
+        return;
     }
-    ESP_ERROR_CHECK(ret);
 
-    //ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    if (starts_with_ignore_case(cmd, "T:") || starts_with_ignore_case(cmd, "STEP:")) {
+        float target = 0.0f;
+        if (parse_float_after_colon(cmd, &target)) {
+            s_app.auto_mode = false;
+            stepper_set_target_deg(target);
+            reply("OK TARGET=%.2f", target);
+        } else {
+            reply("ERR invalid target");
+        }
+        return;
+    }
 
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
+    if (starts_with_ignore_case(cmd, "K:")) {
+        float kp = 0.0f;
+        if (parse_float_after_colon(cmd, &kp) && kp > 0.0f) {
+            stepper_set_kp(kp);
+            reply("OK KP=%.3f", kp);
+        } else {
+            reply("ERR invalid kp");
+        }
+        return;
+    }
 
-    ESP_ERROR_CHECK(esp_bluedroid_init());
-    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    if (equals_ignore_case(cmd, "S") || equals_ignore_case(cmd, "STOP")) {
+        s_app.auto_mode = false;
+        stepper_stop();
+        actuators_stop_all();
+        reply("OK STOP");
+        return;
+    }
 
-    ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_cb));
-    ESP_ERROR_CHECK(esp_spp_register_callback(spp_cb));
-    ESP_ERROR_CHECK(esp_spp_init(ESP_SPP_MODE_CB));
+    if (equals_ignore_case(cmd, "H") || equals_ignore_case(cmd, "HOME")) {
+        stepper_home();
+        reply("OK HOME");
+        return;
+    }
+
+    if (equals_ignore_case(cmd, "I") || equals_ignore_case(cmd, "INFO") ||
+        equals_ignore_case(cmd, "STATUS")) {
+        send_status();
+        return;
+    }
+
+    if (equals_ignore_case(cmd, "HEADER")) {
+        send_telemetry_header();
+        return;
+    }
+
+    if (equals_ignore_case(cmd, "R") || equals_ignore_case(cmd, "READ")) {
+        if (!*have_snapshot) {
+            *snapshot = sensors_sample_all();
+            evaluate_safety(*snapshot);
+            *have_snapshot = true;
+        }
+        char line[768] = {};
+        format_telemetry(*snapshot, line, sizeof(line));
+        bluetooth_spp_send_line(line);
+        printf("%s\n", line);
+        return;
+    }
+
+    if (starts_with_ignore_case(cmd, "STREAM:") || starts_with_ignore_case(cmd, "MON:")) {
+        bool enabled = false;
+        if (parse_bool_arg(cmd, &enabled)) {
+            s_app.stream_bt = enabled;
+            reply("OK STREAM=%s", enabled ? "ON" : "OFF");
+        } else {
+            reply("ERR invalid stream value");
+        }
+        return;
+    }
+
+    if (starts_with_ignore_case(cmd, "AUTO:")) {
+        bool enabled = false;
+        if (parse_bool_arg(cmd, &enabled)) {
+            s_app.auto_mode = enabled;
+            actuators_stop_all();
+            if (!enabled) {
+                stepper_stop();
+            }
+            reply("OK AUTO=%s", enabled ? "ON" : "OFF");
+        } else {
+            reply("ERR invalid auto value");
+        }
+        return;
+    }
+
+    if (starts_with_ignore_case(cmd, "SAFE:")) {
+        bool enabled = false;
+        if (parse_bool_arg(cmd, &enabled)) {
+            s_app.safety_enabled = enabled;
+            reply("OK SAFE=%s", enabled ? "ON" : "OFF");
+        } else {
+            reply("ERR invalid safe value");
+        }
+        return;
+    }
+
+    if (starts_with_ignore_case(cmd, "P:")) {
+        float setpoint = 0.0f;
+        if (parse_float_after_colon(cmd, &setpoint) && setpoint >= 0.0f) {
+            s_app.pressure_setpoint_kpa = setpoint;
+            reply("OK PSET=%.2f", setpoint);
+        } else {
+            reply("ERR invalid pressure setpoint");
+        }
+        return;
+    }
+
+    reply("UNKNOWN CMD: %s", cmd);
 }
+
+}  // namespace
 
 extern "C" void app_main()
 {
-    gpio_reset_pin(STEP_PIN);
-    gpio_reset_pin(DIR_PIN);
-    gpio_reset_pin(EN_PIN);
+    ESP_LOGI(TAG, "Starting mechatronics controller");
 
-    gpio_set_direction(STEP_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(DIR_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(EN_PIN, GPIO_MODE_OUTPUT);
+    ESP_ERROR_CHECK(actuators_init());
+    ESP_ERROR_CHECK(stepper_init());
+    ESP_ERROR_CHECK(sensors_init());
+    ESP_ERROR_CHECK(bluetooth_spp_init());
 
-    gpio_set_level(EN_PIN, 0);
-    gpio_set_level(DIR_PIN, 1);
+    SensorSnapshot latest_snapshot = {};
+    bool have_snapshot = false;
+    uint64_t last_sample_ms = 0;
 
-    esp_rom_delay_us(2000);
+    send_telemetry_header();
 
-    init_bluetooth();
-
-    while (1)
-    {
-        if (cmd_ready) {
-            cmd_ready = false;
-            processCommand(rx_line);
-            memset(rx_line, 0, sizeof(rx_line));
+    while (true) {
+        char cmd[APP_BT_COMMAND_MAX_LEN] = {};
+        while (bluetooth_spp_receive_command(cmd, sizeof(cmd), 0)) {
+            process_command(cmd, &latest_snapshot, &have_snapshot);
+            memset(cmd, 0, sizeof(cmd));
         }
 
-        if (!motor_enabled) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+        const uint64_t now_ms = millis();
+        if (!have_snapshot ||
+            (now_ms - last_sample_ms) >= APP_ALL_SENSORS_SAMPLE_PERIOD_MS) {
+            latest_snapshot = sensors_sample_all();
+            have_snapshot = true;
+            last_sample_ms = now_ms;
+
+            evaluate_safety(latest_snapshot);
+            update_automatic_mode(latest_snapshot);
+            send_telemetry(latest_snapshot);
         }
 
-        float position_deg = getPositionDeg();
-        float error = target_deg - position_deg;
-        float u = kp * error;
-
-        if (fabs(error) <= 1.8f) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        bool dir = (u > 0);
-        setDirection(dir);
-
-        int delay_us = controlToDelayUs(fabs(u));
-        pulseStep(delay_us);
-
-        if (dir) stepCount++;
-        else     stepCount--;
-
-        // Ceder CPU para que corran otras tareas y no se dispare el watchdog
-        vTaskDelay(pdMS_TO_TICKS(1));
+        enforce_manual_safety();
+        stepper_update_once();
+        vTaskDelay(pdMS_TO_TICKS(APP_CONTROL_LOOP_PERIOD_MS));
     }
 }
